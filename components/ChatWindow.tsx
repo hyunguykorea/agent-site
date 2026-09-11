@@ -1,10 +1,15 @@
 // 파일 위치: components/ChatWindow.tsx  (기존 파일 덮어쓰기)
 //
 // 이번 수정
-//  1) "새 대화" = 화면(말풍선)만 비움. Direct Line 대화 세션·에이전트 맥락·도감 데이터는 그대로 유지
-//     → 에이전트는 이전 이야기를 계속 기억합니다. (진짜로 끊고 싶을 때만 "세션 재연결")
-//  2) 디자인 전면 개편 — 그라데이션 배경, 유리질감 카드, 아바타, 말풍선 꼬리, 부드러운 등장 애니메이션
-//  3) 에이전트 이름 위에 작은 한 줄(태그라인) 표시 — .env.local 의 NEXT_PUBLIC_AGENT_TAGLINE 로 바꿀 수 있음
+//  1) ★ 별(즐겨찾기) 버그 수정 — 이제 원문 지문(src)으로 판정합니다.
+//     · 누르면 즉시 ⭐ 로 바뀌고, 새로고침/페이지 이동 후에도 유지됩니다.
+//     · 중복 추가되지 않습니다.
+//  2) 도감 패널에 [전체 / ⭐ 즐겨찾기] 탭 추가
+//
+// 유지되는 기능
+//  · 🧹 새 대화 = 화면만 비우기 (에이전트 기억·도감·기록 모두 보존)
+//  · ↺ 세션 재연결 = 연결이 꼬였을 때만 사용
+//  · 연결 중·생각 중 입력 잠금 / 에코 차단 / 시스템 메시지 필터 / STT·TTS
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -20,9 +25,10 @@ import {
   captureDiscovery,
   subscribeDiscoveries,
   loadDiscoveries,
-  addManual,
-  hasDiscovery,
+  toggleStarByMessage,
   removeDiscovery,
+  toggleFav,
+  sourceKey,
   isSystemMessage,
   type Discovery,
 } from '@/lib/discoveryStore';
@@ -30,14 +36,12 @@ import {
 type Msg = { id: string; role: 'user' | 'bot'; text: string };
 
 const AGENT_NAME = process.env.NEXT_PUBLIC_AGENT_NAME || '한입 에이전트';
-// 🔽 에이전트 이름 "위"에 뜨는 작은 한 줄
 const AGENT_TAGLINE = process.env.NEXT_PUBLIC_AGENT_TAGLINE || '오늘의 한입 지식';
 const AGENT_DESC =
   process.env.NEXT_PUBLIC_AGENT_DESC || '무엇이든 물어보세요. 말로 묻고, 목소리로 듣습니다.';
 const AGENT_EMOJI = process.env.NEXT_PUBLIC_AGENT_EMOJI || '🍕';
 
 const MSG_KEY = 'agent-site-chat-messages';
-
 const SUGGESTIONS = ['오늘의 발견 알려줘', '재미있는 음식 이야기', '우주에 대해 알려줘'];
 
 function norm(s: string) {
@@ -69,8 +73,8 @@ export default function ChatWindow() {
   const [listening, setListening] = useState(false);
   const [dex, setDex] = useState<Discovery[]>([]);
   const [dexOpen, setDexOpen] = useState(false);
+  const [panelTab, setPanelTab] = useState<'all' | 'fav'>('all');
   const [toast, setToast] = useState('');
-  const [tick, setTick] = useState(0);
 
   const connRef = useRef<DLConnection | null>(null);
   const startedRef = useRef(false);
@@ -81,18 +85,18 @@ export default function ChatWindow() {
 
   const locked = status !== 'ready' || pending;
   const dexCount = dex.length;
-  const starredSet = useMemo(
-    () => new Set(dex.map((d) => norm(d.body))),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [dex, tick]
+  const favCount = dex.filter((d) => d.fav).length;
+
+  // ★ 즐겨찾기 판정용 — 원문 지문 집합 (렌더마다 재계산되어 항상 최신)
+  const favSrc = useMemo(
+    () => new Set(dex.filter((d) => d.fav).map((d) => d.src)),
+    [dex]
   );
+  const dexSrc = useMemo(() => new Set(dex.map((d) => d.src)), [dex]);
 
   // 도감 구독 — 새 대화·다른 탭·새 발견 모두 자동 반영
   useEffect(() => {
-    const sync = () => {
-      setDex(loadDiscoveries());
-      setTick((t) => t + 1);
-    };
+    const sync = () => setDex(loadDiscoveries());
     sync();
     return subscribeDiscoveries(sync);
   }, []);
@@ -149,7 +153,6 @@ export default function ChatWindow() {
             if (!text) return;
             if (isEchoOfUser(text)) return;
 
-            // 시스템/메타 메시지는 화면·도감·TTS 모두에서 제외
             if (isSystemMessage(text)) {
               if (pendingTimer.current) clearTimeout(pendingTimer.current);
               setPending(false);
@@ -221,9 +224,7 @@ export default function ChatWindow() {
     [input, pending, status]
   );
 
-  // ── 새 대화 = 화면만 비우기 ──────────────────────────────
-  //  · Direct Line 세션 유지 → 에이전트는 앞 이야기를 계속 기억
-  //  · 도감/기록 데이터도 그대로
+  // 새 대화 = 화면만 비우기 (에이전트 기억·도감·기록 유지)
   const clearScreen = useCallback(() => {
     setMessages([]);
     try {
@@ -232,14 +233,18 @@ export default function ChatWindow() {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
-    setDex(loadDiscoveries()); // 배지 즉시 재동기화
-    setTick((t) => t + 1);
+    setDex(loadDiscoveries());
     showToast('화면을 비웠어요 (기억·도감은 그대로)');
   }, [showToast]);
 
-  // 진짜로 대화를 끊고 싶을 때만 사용 (연결이 꼬였을 때 복구용)
+  // 연결이 꼬였을 때만 — 에이전트 대화 자체를 새로 시작
   const hardReset = useCallback(() => {
-    if (!confirm('에이전트와의 대화를 완전히 새로 시작할까요?\n\n· 에이전트가 앞의 내용을 잊습니다\n· 발견 도감과 기록은 그대로 유지됩니다')) return;
+    if (
+      !confirm(
+        '에이전트와의 대화를 완전히 새로 시작할까요?\n\n· 에이전트가 앞의 내용을 잊습니다\n· 발견 도감과 기록은 그대로 유지됩니다'
+      )
+    )
+      return;
     clearSession();
     setMessages([]);
     try {
@@ -250,24 +255,15 @@ export default function ChatWindow() {
     connect(true);
   }, [connect]);
 
-  // ⭐ 직접 담기 / 빼기
-  const toggleStar = useCallback(
+  // ⭐ 별 토글 — 원문 지문으로 정확히 판정
+  const onStar = useCallback(
     (text: string) => {
-      if (hasDiscovery(text)) {
-        const all = loadDiscoveries();
-        const hit = all.find(
-          (d) => norm(d.body) === norm(text) || norm(text).includes(norm(d.body)) || norm(d.body).includes(norm(text))
-        );
-        if (hit) {
-          removeDiscovery(hit.id);
-          showToast('도감에서 뺐어요');
-        }
-      } else {
-        const d = addManual(text);
-        showToast(d ? `도감에 추가! [${d.category}]` : '담을 내용이 없어요');
-      }
-      setDex(loadDiscoveries());
-      setTick((t) => t + 1);
+      const r = toggleStarByMessage(text);
+      setDex(loadDiscoveries()); // 즉시 반영
+      if (r.action === 'added') showToast(`⭐ 즐겨찾기에 담았어요 [${r.item?.category}]`);
+      else if (r.action === 'faved') showToast('⭐ 즐겨찾기에 추가했어요');
+      else if (r.action === 'unfaved') showToast('☆ 즐겨찾기에서 뺐어요');
+      else showToast('담을 내용이 없어요');
     },
     [showToast]
   );
@@ -318,16 +314,17 @@ export default function ChatWindow() {
       ? 'bg-rose-400 shadow-[0_0_0_4px_rgba(251,113,133,0.25)]'
       : 'animate-pulse bg-amber-400 shadow-[0_0_0_4px_rgba(251,191,36,0.25)]';
 
+  const panelList = (panelTab === 'fav' ? dex.filter((d) => d.fav) : dex).slice().reverse();
+
   return (
     <div className="relative mx-auto flex h-[calc(100dvh-128px)] w-full max-w-2xl flex-col gap-3 p-3 sm:h-[calc(100dvh-72px)] sm:p-4">
-      {/* ── 헤더 카드: 태그라인 → 에이전트 이름 → 설명 ─────────── */}
+      {/* ── 헤더: 태그라인 → 이름 → 설명 ─────────────────── */}
       <header className="rounded-3xl border border-white/60 bg-white/70 p-4 shadow-lg shadow-indigo-100/60 backdrop-blur-xl">
         <div className="flex items-center gap-3">
           <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-2xl shadow-lg shadow-indigo-200">
             {AGENT_EMOJI}
           </div>
           <div className="min-w-0 flex-1">
-            {/* 👇 이름 위 작은 한 줄 */}
             <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-[0.18em] text-indigo-500">
               <span className="inline-block h-1 w-4 rounded-full bg-gradient-to-r from-indigo-400 to-fuchsia-400" />
               {AGENT_TAGLINE}
@@ -343,17 +340,28 @@ export default function ChatWindow() {
           </span>
         </div>
 
-        {/* 툴바 */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="flex items-center gap-2 rounded-full bg-white/80 px-3 py-1.5 text-xs font-semibold text-slate-600 ring-1 ring-slate-200 sm:hidden">
             <span className={'inline-block h-2 w-2 rounded-full ' + dotClass} />
             {statusLabel}
           </span>
           <button
-            onClick={() => setDexOpen(true)}
+            onClick={() => {
+              setPanelTab('all');
+              setDexOpen(true);
+            }}
             className="rounded-full bg-gradient-to-r from-amber-400 to-orange-400 px-3 py-1.5 text-xs font-bold text-white shadow-md shadow-amber-200 transition hover:brightness-105 active:scale-95"
           >
             📖 도감 {dexCount}
+          </button>
+          <button
+            onClick={() => {
+              setPanelTab('fav');
+              setDexOpen(true);
+            }}
+            className="rounded-full bg-white px-3 py-1.5 text-xs font-bold text-amber-600 ring-1 ring-amber-200 transition hover:bg-amber-50 active:scale-95"
+          >
+            ⭐ 즐겨찾기 {favCount}
           </button>
           <button
             onClick={clearScreen}
@@ -400,7 +408,7 @@ export default function ChatWindow() {
         </div>
       )}
 
-      {/* ── 메시지 영역 ────────────────────────────────────── */}
+      {/* ── 메시지 ─────────────────────────────────────── */}
       <div
         ref={scrollRef}
         className="flex-1 space-y-4 overflow-y-auto rounded-3xl border border-white/60 bg-white/70 p-4 shadow-lg shadow-indigo-100/50 backdrop-blur-xl"
@@ -414,9 +422,7 @@ export default function ChatWindow() {
               <p className="font-bold text-slate-700">
                 {status === 'connecting' ? '에이전트를 부르는 중…' : '무엇이 궁금하세요?'}
               </p>
-              <p className="mt-1 text-sm text-slate-400">
-                아래 버튼을 누르거나 🎤 로 말해보세요.
-              </p>
+              <p className="mt-1 text-sm text-slate-400">아래 버튼을 누르거나 🎤 로 말해보세요.</p>
               <div className="mt-4 flex flex-wrap justify-center gap-2">
                 {SUGGESTIONS.map((s) => (
                   <button
@@ -434,7 +440,6 @@ export default function ChatWindow() {
         )}
 
         {messages.map((m) => {
-          const starred = m.role === 'bot' && starredSet.has(norm(m.text));
           if (m.role === 'user') {
             return (
               <div key={m.id} className="flex justify-end">
@@ -444,6 +449,9 @@ export default function ChatWindow() {
               </div>
             );
           }
+          const key = sourceKey(m.text);
+          const starred = favSrc.has(key);
+          const saved = dexSrc.has(key);
           return (
             <div key={m.id} className="flex items-end gap-2">
               <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-gradient-to-br from-indigo-100 to-fuchsia-100 text-base">
@@ -451,14 +459,22 @@ export default function ChatWindow() {
               </div>
               <div className="max-w-[78%] whitespace-pre-wrap rounded-3xl rounded-bl-md bg-white px-4 py-3 leading-relaxed text-slate-800 shadow-md ring-1 ring-slate-100">
                 {m.text}
+                {saved && !starred && (
+                  <span className="mt-1 block text-[11px] font-semibold text-slate-400">
+                    📖 도감에 있음
+                  </span>
+                )}
               </div>
               <button
-                onClick={() => toggleStar(m.text)}
+                onClick={() => onStar(m.text)}
+                aria-pressed={starred}
                 className={
-                  'shrink-0 rounded-full p-1.5 text-lg leading-none transition active:scale-90 ' +
-                  (starred ? 'bg-amber-50' : 'opacity-40 hover:opacity-100')
+                  'shrink-0 rounded-full p-1.5 text-xl leading-none transition active:scale-90 ' +
+                  (starred
+                    ? 'bg-amber-100 text-amber-500 shadow-sm'
+                    : 'text-slate-300 hover:bg-slate-100 hover:text-amber-400')
                 }
-                title={starred ? '도감에서 빼기' : '도감에 담기'}
+                title={starred ? '즐겨찾기에서 빼기' : '즐겨찾기에 담기'}
               >
                 {starred ? '⭐' : '☆'}
               </button>
@@ -482,7 +498,7 @@ export default function ChatWindow() {
         )}
       </div>
 
-      {/* ── 입력 영역 ──────────────────────────────────────── */}
+      {/* ── 입력 ───────────────────────────────────────── */}
       <div className="flex items-center gap-2 rounded-3xl border border-white/60 bg-white/70 p-2 shadow-lg shadow-indigo-100/50 backdrop-blur-xl">
         <button
           onClick={toggleMic}
@@ -513,7 +529,7 @@ export default function ChatWindow() {
               ? '답변을 기다리는 중…'
               : '메시지를 입력하세요'
           }
-          className="h-12 min-w-0 flex-1 rounded-2xl bg-transparent px-3 text-slate-800 placeholder:text-slate-400 outline-none disabled:text-slate-400"
+          className="h-12 min-w-0 flex-1 rounded-2xl bg-transparent px-3 text-slate-800 outline-none placeholder:text-slate-400 disabled:text-slate-400"
         />
         <button
           onClick={() => send()}
@@ -524,7 +540,7 @@ export default function ChatWindow() {
         </button>
       </div>
 
-      {/* ── 도감 슬라이드 패널 ─────────────────────────────── */}
+      {/* ── 도감 / 즐겨찾기 패널 ───────────────────────── */}
       {dexOpen && (
         <>
           <div
@@ -532,54 +548,95 @@ export default function ChatWindow() {
             onClick={() => setDexOpen(false)}
           />
           <aside className="fixed right-0 top-0 z-50 flex h-full w-full max-w-sm flex-col bg-gradient-to-b from-amber-50 to-white shadow-2xl">
-            <header className="flex items-center justify-between border-b border-amber-100 p-4">
-              <h2 className="text-lg font-extrabold text-slate-800">📖 발견 도감 {dexCount}</h2>
-              <button
-                onClick={() => setDexOpen(false)}
-                className="rounded-full bg-white px-3 py-1.5 text-sm ring-1 ring-slate-200"
-              >
-                닫기
-              </button>
+            <header className="border-b border-amber-100 p-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-extrabold text-slate-800">발견 도감</h2>
+                <button
+                  onClick={() => setDexOpen(false)}
+                  className="rounded-full bg-white px-3 py-1.5 text-sm ring-1 ring-slate-200"
+                >
+                  닫기
+                </button>
+              </div>
+              <div className="mt-3 flex gap-1.5 rounded-2xl bg-white/70 p-1 ring-1 ring-amber-100">
+                {([
+                  ['all', `📖 전체 ${dexCount}`],
+                  ['fav', `⭐ 즐겨찾기 ${favCount}`],
+                ] as const).map(([k, label]) => (
+                  <button
+                    key={k}
+                    onClick={() => setPanelTab(k)}
+                    className={
+                      'flex-1 rounded-xl px-2 py-2 text-xs font-bold transition ' +
+                      (panelTab === k
+                        ? 'bg-gradient-to-r from-amber-400 to-orange-400 text-white shadow'
+                        : 'text-slate-500 hover:bg-white')
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </header>
+
             <div className="flex-1 space-y-3 overflow-y-auto p-4">
-              {dex.length === 0 ? (
+              {panelList.length === 0 ? (
                 <p className="pt-10 text-center text-sm leading-relaxed text-slate-500">
-                  아직 발견이 없습니다.
-                  <br />
-                  마음에 드는 답변 옆 ☆ 를 눌러 담아보세요!
+                  {panelTab === 'fav' ? (
+                    <>
+                      즐겨찾기가 비어 있어요.
+                      <br />
+                      답변 옆 ☆ 를 눌러 별을 달아보세요!
+                    </>
+                  ) : (
+                    <>
+                      아직 발견이 없습니다.
+                      <br />
+                      마음에 드는 답변 옆 ☆ 를 눌러 담아보세요!
+                    </>
+                  )}
                 </p>
               ) : (
-                dex
-                  .slice()
-                  .reverse()
-                  .map((d) => (
-                    <article
-                      key={d.id}
-                      className="rounded-2xl bg-white p-3 shadow-sm ring-1 ring-amber-100"
-                    >
-                      <div className="mb-1 flex items-center justify-between">
-                        <span className="rounded-full bg-gradient-to-r from-amber-400 to-orange-400 px-2.5 py-0.5 text-xs font-bold text-white">
-                          {d.category}
-                        </span>
+                panelList.map((d) => (
+                  <article
+                    key={d.id}
+                    className="animate-pop rounded-2xl bg-white p-3 shadow-sm ring-1 ring-amber-100"
+                  >
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span className="rounded-full bg-gradient-to-r from-amber-400 to-orange-400 px-2.5 py-0.5 text-xs font-bold text-white">
+                        {d.category}
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <button
+                          onClick={() => {
+                            toggleFav(d.id);
+                            setDex(loadDiscoveries());
+                          }}
+                          className="rounded-full px-1 text-base leading-none"
+                          title={d.fav ? '즐겨찾기 해제' : '즐겨찾기'}
+                        >
+                          {d.fav ? '⭐' : '☆'}
+                        </button>
                         <button
                           onClick={() => {
                             removeDiscovery(d.id);
                             setDex(loadDiscoveries());
-                            setTick((t) => t + 1);
                           }}
                           className="text-xs text-slate-400 hover:text-rose-500"
                         >
                           삭제
                         </button>
-                      </div>
-                      <p className="text-sm leading-relaxed text-slate-700">{d.body}</p>
-                      <div className="mt-1 text-[11px] text-slate-400">
-                        {new Date(d.at).toLocaleString('ko-KR')}
-                      </div>
-                    </article>
-                  ))
+                      </span>
+                    </div>
+                    <p className="text-sm leading-relaxed text-slate-700">{d.body}</p>
+                    <div className="mt-1 text-[11px] text-slate-400">
+                      {new Date(d.at).toLocaleString('ko-KR')}
+                    </div>
+                  </article>
+                ))
               )}
             </div>
+
             <footer className="border-t border-amber-100 p-3">
               <a
                 href="/dex"
