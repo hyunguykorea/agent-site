@@ -1,12 +1,12 @@
 // 파일 위치: components/ChatWindow.tsx  (기존 파일 덮어쓰기)
 //
-// 이번 변경점 (발견 도감이 사라지던 문제)
-//  1) 봇 응답에서 "발견"을 감지해 localStorage 도감에 즉시 저장 → 페이지를 나갔다 와도 유지
-//  2) 대화 말풍선도 localStorage 에 저장 → 채팅 탭 재방문 시 그대로 복원
-//  3) Direct Line 대화 자체도 이어감(dlClient resume) → 에이전트가 앞 얘기를 기억
-//  4) "새 대화" 버튼으로 원할 때만 초기화 (도감은 지워지지 않음)
+// 이번 수정 (새 대화 시 도감이 사라져 보이던 문제)
+//  · 도감 개수를 subscribeDiscoveries 로 구독 → 새 대화·다른 탭·새 발견에 자동 반영
+//  · newChat 은 말풍선과 Direct Line 세션만 초기화. 도감 저장소는 절대 건드리지 않음
+//  · 새 대화 직후 도감 개수를 강제로 재동기화
+//  · 확인창 문구에 "도감은 유지됩니다" 명시
 //
-// 기존 기능 유지: 연결 중/생각 중 입력 잠금, 에코 차단, STT/TTS
+// 유지: 연결 중/생각 중 입력 잠금, 에코 차단, STT/TTS, 대화 복원
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -18,7 +18,11 @@ import {
 } from '@/lib/dlClient';
 import { cleanForTTS } from '@/lib/ttsClean';
 import { addHistory } from '@/lib/historyStore';
-import { captureDiscovery, loadDiscoveries } from '@/lib/discoveryStore';
+import {
+  captureDiscovery,
+  countDiscoveries,
+  subscribeDiscoveries,
+} from '@/lib/discoveryStore';
 
 type Msg = { id: string; role: 'user' | 'bot'; text: string };
 
@@ -54,8 +58,8 @@ export default function ChatWindow() {
   const [pending, setPending] = useState(false);
   const [ttsOn, setTtsOn] = useState(true);
   const [listening, setListening] = useState(false);
-  const [dexCount, setDexCount] = useState(0);   // 도감 개수 배지
-  const [toast, setToast] = useState('');        // "도감에 추가!" 안내
+  const [dexCount, setDexCount] = useState(0);
+  const [toast, setToast] = useState('');
 
   const connRef = useRef<DLConnection | null>(null);
   const startedRef = useRef(false);
@@ -66,13 +70,19 @@ export default function ChatWindow() {
 
   const locked = status !== 'ready' || pending;
 
-  // ── 마운트 시 저장된 대화·도감 복원 ───────────────────────
+  // ── ★ 도감 개수를 "구독" — 무슨 일이 있어도 화면이 최신값을 따라간다 ──
   useEffect(() => {
-    setMessages(loadMsgs());
-    setDexCount(loadDiscoveries().length);
+    const sync = () => setDexCount(countDiscoveries());
+    sync();                                  // 마운트 시 1회
+    const unsub = subscribeDiscoveries(sync); // 변경 시마다
+    return unsub;
   }, []);
 
-  // ── 메시지가 바뀔 때마다 저장 ────────────────────────────
+  // ── 저장된 대화 복원 ─────────────────────────────────────
+  useEffect(() => {
+    setMessages(loadMsgs());
+  }, []);
+
   useEffect(() => {
     if (messages.length) saveMsgs(messages);
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -128,10 +138,9 @@ export default function ChatWindow() {
             setPending(false);
             addHistory('bot', text);
 
-            // ★ 발견 도감에 영구 저장
+            // 발견 도감에 영구 저장 (구독 덕분에 배지가 자동 증가)
             const found = captureDiscovery(text);
             if (found) {
-              setDexCount(loadDiscoveries().length);
               setToast(`도감에 추가! [${found.category}]`);
               setTimeout(() => setToast(''), 2500);
             }
@@ -144,6 +153,7 @@ export default function ChatWindow() {
         setStatus('error');
         setErrorMsg(e?.message || '연결에 실패했습니다.');
       }
+      setDexCount(countDiscoveries()); // 연결 직후에도 재동기화
     },
     [isEchoOfUser, speak]
   );
@@ -188,16 +198,18 @@ export default function ChatWindow() {
     [input, pending, status]
   );
 
-  // ── 새 대화 (도감·기록은 보존) ───────────────────────────
+  // ── 새 대화 — 도감 저장소는 절대 건드리지 않는다 ──────────
   const newChat = useCallback(() => {
-    if (!confirm('새 대화를 시작할까요? (발견 도감은 그대로 유지됩니다)')) return;
-    clearSession();
+    if (!confirm('새 대화를 시작할까요?\n\n· 대화 말풍선만 초기화됩니다\n· 발견 도감은 그대로 유지됩니다')) {
+      return;
+    }
+    clearSession();          // Direct Line 세션만 초기화
     setMessages([]);
-    saveMsgs([]);
     try {
-      window.localStorage.removeItem(MSG_KEY);
+      window.localStorage.removeItem(MSG_KEY); // 말풍선만 삭제
     } catch {}
     sentTextsRef.current = [];
+    setDexCount(countDiscoveries()); // ★ 배지 즉시 재동기화 (이게 빠져서 0으로 보였음)
     connect(true);
   }, [connect]);
 
@@ -259,9 +271,13 @@ export default function ChatWindow() {
           {statusLabel}
         </span>
         <span className="flex items-center gap-2">
-          <span className="rounded-xl bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-700">
+          <a
+            href="/history"
+            className="rounded-xl bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-700"
+            title="발견 도감 보기"
+          >
             📖 도감 {dexCount}
-          </span>
+          </a>
           <button onClick={newChat} className="rounded-xl border border-slate-300 px-2 py-1 text-xs">
             새 대화
           </button>
@@ -279,7 +295,6 @@ export default function ChatWindow() {
         </span>
       </div>
 
-      {/* 토스트 */}
       {toast && (
         <div className="pointer-events-none absolute left-1/2 top-16 z-10 -translate-x-1/2 rounded-full bg-amber-500 px-4 py-2 text-sm font-semibold text-white shadow-lg">
           {toast}
