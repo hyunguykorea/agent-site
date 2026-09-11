@@ -1,12 +1,12 @@
 // 파일 위치: components/ChatWindow.tsx  (기존 파일 덮어쓰기)
 //
-// 이번 수정 (새 대화 시 도감이 사라져 보이던 문제)
-//  · 도감 개수를 subscribeDiscoveries 로 구독 → 새 대화·다른 탭·새 발견에 자동 반영
-//  · newChat 은 말풍선과 Direct Line 세션만 초기화. 도감 저장소는 절대 건드리지 않음
-//  · 새 대화 직후 도감 개수를 강제로 재동기화
-//  · 확인창 문구에 "도감은 유지됩니다" 명시
-//
-// 유지: 연결 중/생각 중 입력 잠금, 에코 차단, STT/TTS, 대화 복원
+// 이번 수정
+//  1) 채팅 화면에서 바로 도감 확인 — 상단 "📖 도감 N" 을 누르면 오른쪽에서 패널이 슬라이드
+//     (기록 페이지까지 안 가도 됨)
+//  2) 말풍선마다 ⭐ 버튼 — 파서가 놓친 발견도 직접 담을 수 있음 (이미 담긴 건 ★ 노란색)
+//  3) 시스템/메타 메시지("Manage your memories", "I'll check your discovery log.") 는
+//     말풍선에 안 띄우고, 도감에도 안 넣고, TTS 로도 안 읽음
+//  4) 새 대화를 해도 도감 배지는 구독으로 항상 최신 유지
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -22,6 +22,12 @@ import {
   captureDiscovery,
   countDiscoveries,
   subscribeDiscoveries,
+  loadDiscoveries,
+  addManual,
+  hasDiscovery,
+  removeDiscovery,
+  isSystemMessage,
+  type Discovery,
 } from '@/lib/discoveryStore';
 
 type Msg = { id: string; role: 'user' | 'bot'; text: string };
@@ -45,9 +51,7 @@ function loadMsgs(): Msg[] {
 function saveMsgs(list: Msg[]) {
   try {
     window.localStorage.setItem(MSG_KEY, JSON.stringify(list.slice(-100)));
-  } catch {
-    /* 무시 */
-  }
+  } catch {}
 }
 
 export default function ChatWindow() {
@@ -58,8 +62,10 @@ export default function ChatWindow() {
   const [pending, setPending] = useState(false);
   const [ttsOn, setTtsOn] = useState(true);
   const [listening, setListening] = useState(false);
-  const [dexCount, setDexCount] = useState(0);
+  const [dex, setDex] = useState<Discovery[]>([]);
+  const [dexOpen, setDexOpen] = useState(false);
   const [toast, setToast] = useState('');
+  const [tick, setTick] = useState(0); // ⭐ 표시 갱신용
 
   const connRef = useRef<DLConnection | null>(null);
   const startedRef = useRef(false);
@@ -69,16 +75,18 @@ export default function ChatWindow() {
   const sentTextsRef = useRef<string[]>([]);
 
   const locked = status !== 'ready' || pending;
+  const dexCount = dex.length;
 
-  // ── ★ 도감 개수를 "구독" — 무슨 일이 있어도 화면이 최신값을 따라간다 ──
+  // 도감 구독 — 새 대화·다른 탭·새 발견 모두 자동 반영
   useEffect(() => {
-    const sync = () => setDexCount(countDiscoveries());
-    sync();                                  // 마운트 시 1회
-    const unsub = subscribeDiscoveries(sync); // 변경 시마다
-    return unsub;
+    const sync = () => {
+      setDex(loadDiscoveries());
+      setTick((t) => t + 1);
+    };
+    sync();
+    return subscribeDiscoveries(sync);
   }, []);
 
-  // ── 저장된 대화 복원 ─────────────────────────────────────
   useEffect(() => {
     setMessages(loadMsgs());
   }, []);
@@ -88,7 +96,6 @@ export default function ChatWindow() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages, pending]);
 
-  // ── TTS ────────────────────────────────────────────────
   const speak = useCallback(
     (raw: string) => {
       if (!ttsOn || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
@@ -109,7 +116,11 @@ export default function ChatWindow() {
     return sentTextsRef.current.slice(-5).some((s) => norm(s) === n);
   }, []);
 
-  // ── 연결 ────────────────────────────────────────────────
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2500);
+  }, []);
+
   const connect = useCallback(
     async (forceNew = false) => {
       connRef.current?.stop();
@@ -128,6 +139,13 @@ export default function ChatWindow() {
             if (!text) return;
             if (isEchoOfUser(text)) return;
 
+            // 시스템/메타 메시지는 화면·도감·TTS 모두에서 제외
+            if (isSystemMessage(text)) {
+              if (pendingTimer.current) clearTimeout(pendingTimer.current);
+              setPending(false);
+              return;
+            }
+
             setMessages((prev) => {
               const last = prev[prev.length - 1];
               if (last && last.role === 'bot' && norm(last.text) === norm(text)) return prev;
@@ -138,12 +156,8 @@ export default function ChatWindow() {
             setPending(false);
             addHistory('bot', text);
 
-            // 발견 도감에 영구 저장 (구독 덕분에 배지가 자동 증가)
             const found = captureDiscovery(text);
-            if (found) {
-              setToast(`도감에 추가! [${found.category}]`);
-              setTimeout(() => setToast(''), 2500);
-            }
+            if (found) showToast(`도감에 추가! [${found.category}]`);
 
             speak(text);
           },
@@ -153,9 +167,9 @@ export default function ChatWindow() {
         setStatus('error');
         setErrorMsg(e?.message || '연결에 실패했습니다.');
       }
-      setDexCount(countDiscoveries()); // 연결 직후에도 재동기화
+      setDex(loadDiscoveries());
     },
-    [isEchoOfUser, speak]
+    [isEchoOfUser, showToast, speak]
   );
 
   useEffect(() => {
@@ -170,7 +184,6 @@ export default function ChatWindow() {
     };
   }, [connect]);
 
-  // ── 전송 ────────────────────────────────────────────────
   const send = useCallback(
     async (raw?: string) => {
       const text = (raw ?? input).trim();
@@ -198,22 +211,42 @@ export default function ChatWindow() {
     [input, pending, status]
   );
 
-  // ── 새 대화 — 도감 저장소는 절대 건드리지 않는다 ──────────
+  // 새 대화 — 도감은 건드리지 않음
   const newChat = useCallback(() => {
-    if (!confirm('새 대화를 시작할까요?\n\n· 대화 말풍선만 초기화됩니다\n· 발견 도감은 그대로 유지됩니다')) {
-      return;
-    }
-    clearSession();          // Direct Line 세션만 초기화
+    if (!confirm('새 대화를 시작할까요?\n\n· 대화 말풍선만 초기화됩니다\n· 발견 도감은 그대로 유지됩니다')) return;
+    clearSession();
     setMessages([]);
     try {
-      window.localStorage.removeItem(MSG_KEY); // 말풍선만 삭제
+      window.localStorage.removeItem(MSG_KEY);
     } catch {}
     sentTextsRef.current = [];
-    setDexCount(countDiscoveries()); // ★ 배지 즉시 재동기화 (이게 빠져서 0으로 보였음)
+    setDex(loadDiscoveries()); // 배지 즉시 재동기화
     connect(true);
   }, [connect]);
 
-  // ── STT ─────────────────────────────────────────────────
+  // ⭐ 직접 담기 / 빼기
+  const toggleStar = useCallback(
+    (text: string) => {
+      if (hasDiscovery(text)) {
+        const target = loadDiscoveries().find((d) => norm(d.body) === norm(text.replace(/\s+/g, ' ')));
+        const all = loadDiscoveries();
+        const hit =
+          target ??
+          all.find((d) => norm(text).includes(norm(d.body)) || norm(d.body).includes(norm(text)));
+        if (hit) {
+          removeDiscovery(hit.id);
+          showToast('도감에서 뺐어요');
+        }
+      } else {
+        const d = addManual(text);
+        showToast(d ? `도감에 추가! [${d.category}]` : '담을 내용이 없어요');
+      }
+      setDex(loadDiscoveries());
+      setTick((t) => t + 1);
+    },
+    [showToast]
+  );
+
   const toggleMic = useCallback(() => {
     if (typeof window === 'undefined') return;
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -271,13 +304,12 @@ export default function ChatWindow() {
           {statusLabel}
         </span>
         <span className="flex items-center gap-2">
-          <a
-            href="/history"
-            className="rounded-xl bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-700"
-            title="발견 도감 보기"
+          <button
+            onClick={() => setDexOpen(true)}
+            className="rounded-xl bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-200"
           >
             📖 도감 {dexCount}
-          </a>
+          </button>
           <button onClick={newChat} className="rounded-xl border border-slate-300 px-2 py-1 text-xs">
             새 대화
           </button>
@@ -296,7 +328,7 @@ export default function ChatWindow() {
       </div>
 
       {toast && (
-        <div className="pointer-events-none absolute left-1/2 top-16 z-10 -translate-x-1/2 rounded-full bg-amber-500 px-4 py-2 text-sm font-semibold text-white shadow-lg">
+        <div className="pointer-events-none absolute left-1/2 top-16 z-30 -translate-x-1/2 rounded-full bg-amber-500 px-4 py-2 text-sm font-semibold text-white shadow-lg">
           {toast}
         </div>
       )}
@@ -306,18 +338,30 @@ export default function ChatWindow() {
         {messages.length === 0 && status === 'connecting' && (
           <p className="text-center text-slate-400">에이전트와 연결하고 있습니다…</p>
         )}
-        {messages.map((m) => (
-          <div key={m.id} className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
-            <div
-              className={
-                'max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-3 leading-relaxed ' +
-                (m.role === 'user' ? 'bg-indigo-500 text-white' : 'bg-slate-100 text-slate-800')
-              }
-            >
-              {m.text}
+        {messages.map((m) => {
+          const starred = m.role === 'bot' && hasDiscovery(m.text);
+          return (
+            <div key={m.id + tick} className={m.role === 'user' ? 'flex justify-end' : 'flex items-start justify-start gap-1'}>
+              <div
+                className={
+                  'max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-3 leading-relaxed ' +
+                  (m.role === 'user' ? 'bg-indigo-500 text-white' : 'bg-slate-100 text-slate-800')
+                }
+              >
+                {m.text}
+              </div>
+              {m.role === 'bot' && (
+                <button
+                  onClick={() => toggleStar(m.text)}
+                  className="mt-2 shrink-0 text-lg leading-none opacity-70 hover:opacity-100"
+                  title={starred ? '도감에서 빼기' : '도감에 담기'}
+                >
+                  {starred ? '⭐' : '☆'}
+                </button>
+              )}
             </div>
-          </div>
-        ))}
+          );
+        })}
         {pending && (
           <div className="flex justify-start">
             <div className="rounded-2xl bg-slate-100 px-4 py-3 text-slate-500">
@@ -370,6 +414,65 @@ export default function ChatWindow() {
           전송
         </button>
       </div>
+
+      {/* ── 도감 패널 (채팅 화면에서 바로 확인) ───────────────── */}
+      {dexOpen && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/30" onClick={() => setDexOpen(false)} />
+          <aside className="fixed right-0 top-0 z-50 flex h-full w-full max-w-sm flex-col bg-white shadow-2xl">
+            <header className="flex items-center justify-between border-b p-4">
+              <h2 className="text-lg font-bold">📖 발견 도감 {dexCount}</h2>
+              <button onClick={() => setDexOpen(false)} className="rounded-xl border px-3 py-1 text-sm">
+                닫기
+              </button>
+            </header>
+            <div className="flex-1 space-y-3 overflow-y-auto p-4">
+              {dex.length === 0 ? (
+                <p className="pt-10 text-center text-sm text-slate-500">
+                  아직 발견이 없습니다.
+                  <br />
+                  마음에 드는 답변 옆 ☆ 를 눌러 담아보세요!
+                </p>
+              ) : (
+                dex
+                  .slice()
+                  .reverse()
+                  .map((d) => (
+                    <article key={d.id} className="rounded-2xl bg-slate-50 p-3">
+                      <div className="mb-1 flex items-center justify-between">
+                        <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700">
+                          {d.category}
+                        </span>
+                        <button
+                          onClick={() => {
+                            removeDiscovery(d.id);
+                            setDex(loadDiscoveries());
+                            setTick((t) => t + 1);
+                          }}
+                          className="text-xs text-slate-400 hover:text-red-500"
+                        >
+                          삭제
+                        </button>
+                      </div>
+                      <p className="text-sm leading-relaxed text-slate-700">{d.body}</p>
+                      <div className="mt-1 text-[11px] text-slate-400">
+                        {new Date(d.at).toLocaleString('ko-KR')}
+                      </div>
+                    </article>
+                  ))
+              )}
+            </div>
+            <footer className="border-t p-3">
+              <a
+                href="/dex"
+                className="block rounded-2xl bg-indigo-500 py-3 text-center font-semibold text-white"
+              >
+                도감 전체 보기
+              </a>
+            </footer>
+          </aside>
+        </>
+      )}
     </div>
   );
 }
