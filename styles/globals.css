@@ -1,3 +1,7 @@
+/* 파일 위치: styles/globals.css  (기존 파일 덮어쓰기)
+   - 칙칙한 흰 배경 → 은은한 그라데이션 + 빛망울(blob) 배경
+   - 스크롤바, 선택색, 폰트까지 한 번에 톤업 */
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -7,26 +11,90 @@
 }
 
 html,
-body {
-  height: 100%;
+body,
+#__next {
+  min-height: 100%;
 }
 
 body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+  /* 부드러운 파스텔 그라데이션 배경 */
+  background:
+    radial-gradient(1000px 600px at 12% -8%, #e0e7ff 0%, transparent 55%),
+    radial-gradient(900px 600px at 92% 4%, #fae8ff 0%, transparent 55%),
+    radial-gradient(900px 700px at 50% 110%, #ccfbf1 0%, transparent 55%),
+    linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+  background-attachment: fixed;
+  color: #0f172a;
+  -webkit-font-smoothing: antialiased;
+  font-family: 'Pretendard', 'Apple SD Gothic Neo', 'Noto Sans KR', system-ui, -apple-system,
+    'Segoe UI', sans-serif;
 }
 
-.card {
-  @apply rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200;
+/* 모바일 하단 탭바에 내용이 가리지 않도록 */
+@media (max-width: 639px) {
+  body {
+    padding-bottom: 3.5rem;
+  }
 }
 
-.btn {
-  @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-3 text-base font-semibold transition active:scale-[0.98];
+::selection {
+  background: #c7d2fe;
+  color: #1e1b4b;
 }
 
-.btn-primary {
-  @apply btn bg-brand-500 text-white hover:bg-brand-600 disabled:opacity-40;
+/* 얇고 예쁜 스크롤바 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
 }
 
-.btn-ghost {
-  @apply btn bg-white text-slate-700 ring-1 ring-slate-200 hover:bg-slate-100;
+/* 토스트 등장 애니메이션 */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* 카드 등장 애니메이션 (도감 카드 등에서 사용 가능) */
+@keyframes popIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.animate-pop {
+  animation: popIn 0.25s ease-out both;
+}
+
+/* 애니메이션 최소화 설정 존중 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
