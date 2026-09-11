@@ -1,14 +1,12 @@
 // 파일 위치: lib/discoveryStore.ts  (기존 파일 덮어쓰기)
 //
-// "새 대화를 하면 도감이 사라진다" 의 진짜 원인
-//   데이터는 localStorage 에 멀쩡히 남아 있었지만,
-//   화면의 개수 배지/목록이 React state 에 박혀 있어서 갱신이 안 됐습니다.
-//   → 저장소가 바뀔 때마다 "구독자에게 알려주는" 구조로 바꿉니다. (subscribe)
-//
-// 추가 안전장치
-//   · 저장 실패/JSON 손상 시 기존 데이터를 날리지 않고 백업본에서 복구
-//   · 다른 탭에서 추가해도 즉시 반영 (storage 이벤트)
-//   · clearDiscoveries() 는 "도감 비우기" 버튼에서만 호출 (새 대화와 완전 분리)
+// 이번 수정 2가지
+//  1) 파서가 너무 엄격해서 실제 봇 응답이 도감에 안 들어가던 문제
+//     → 카테고리 [ ] 가 없어도 "사실형 문장"이면 등록되도록 완화
+//     → 그래도 놓치면 사용자가 말풍선의 ⭐ 버튼으로 직접 담을 수 있음 (addManual)
+//  2) 시스템/메타 메시지 차단
+//     "Manage your memories", "I'll check your discovery log." 같은 안내문은
+//     도감에도 넣지 않고 TTS 로도 읽지 않습니다.
 
 export type Discovery = {
   id: string;
@@ -27,6 +25,38 @@ function norm(s: string): string {
   return (s || '').replace(/\s+/g, '').replace(/[.,!?~…"'`]/g, '').toLowerCase();
 }
 
+/**
+ * 시스템/메타 메시지 판별.
+ * Copilot Studio 의 메모리 안내(영어)나 내부 상태 문구는 대화 내용이 아니므로 걸러냅니다.
+ */
+export function isSystemMessage(raw: string): boolean {
+  if (!raw) return true;
+  const t = raw.trim();
+  if (!t) return true;
+
+  const patterns = [
+    /manage your memories/i,
+    /copilotstudio\.microsoft\.com/i,
+    /discovery log/i,
+    /i'?ll check your/i,
+    /let me check your/i,
+    /\/environments\/[\w-]+\/agents\//i,
+    /^(ok|okay|sure|got it|thanks)[.!]?$/i,
+  ];
+  if (patterns.some((p) => p.test(t))) return true;
+
+  // 링크/괄호/기호를 걷어낸 뒤 알맹이가 없으면 시스템 메시지로 간주
+  const stripped = t
+    .replace(/\(([^)]*)\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (stripped.length < 2) return true;
+
+  return false;
+}
+
 function readKey(key: string): Discovery[] | null {
   try {
     const raw = window.localStorage.getItem(key);
@@ -38,15 +68,12 @@ function readKey(key: string): Discovery[] | null {
   }
 }
 
-/** 도감 읽기 — 본 키가 깨졌으면 백업본으로 자동 복구 */
 export function loadDiscoveries(): Discovery[] {
   if (typeof window === 'undefined') return [];
   const main = readKey(KEY);
   if (main && main.length) return main;
-
   const backup = readKey(BACKUP_KEY);
   if (backup && backup.length) {
-    // 본 키가 비었/깨졌는데 백업이 있으면 되살린다
     try {
       window.localStorage.setItem(KEY, JSON.stringify(backup));
     } catch {}
@@ -60,23 +87,16 @@ function save(list: Discovery[]): void {
   const json = JSON.stringify(trimmed);
   try {
     window.localStorage.setItem(KEY, json);
-    window.localStorage.setItem(BACKUP_KEY, json); // 이중 저장
-  } catch {
-    /* 용량 초과 등 — 기존 데이터는 그대로 둔다 */
-  }
+    window.localStorage.setItem(BACKUP_KEY, json);
+  } catch {}
   notify();
 }
 
-/** 변경 알림 — 배지·목록이 자동으로 다시 그려진다 */
 function notify(): void {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent(EVENT));
 }
 
-/**
- * 도감 변경 구독. 컴포넌트에서 useEffect 로 연결하면
- * 새 대화·다른 탭·새 발견 무엇이든 자동 반영됩니다.
- */
 export function subscribeDiscoveries(cb: () => void): () => void {
   if (typeof window === 'undefined') return () => {};
   const onStorage = (e: StorageEvent) => {
@@ -84,7 +104,7 @@ export function subscribeDiscoveries(cb: () => void): () => void {
   };
   window.addEventListener(EVENT, cb);
   window.addEventListener('storage', onStorage);
-  window.addEventListener('focus', cb); // 탭 복귀 시에도 재확인
+  window.addEventListener('focus', cb);
   return () => {
     window.removeEventListener(EVENT, cb);
     window.removeEventListener('storage', onStorage);
@@ -92,51 +112,77 @@ export function subscribeDiscoveries(cb: () => void): () => void {
   };
 }
 
+/** 본문 정리: 링크·이모지·괄호·마크다운 제거 */
+function cleanBody(s: string): string {
+  return s
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, ' ')
+    .replace(/[*_#>`]/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+const CATEGORY_HINTS: Array<[RegExp, string]> = [
+  [/피자|음식|요리|먹|맛|치킨|커피|라면|과자/, '음식'],
+  [/우주|행성|별|은하|토성|화성|달\b/, '우주'],
+  [/역사|로마|조선|왕|전쟁|고대/, '역사'],
+  [/동물|고양이|강아지|새|물고기|곤충/, '동물'],
+  [/과학|물리|화학|생물|실험|원소/, '과학'],
+  [/영화|음악|게임|책|드라마|만화/, '문화'],
+  [/몸|건강|수면|운동|뇌|심장/, '건강'],
+];
+
+function guessCategory(text: string): string {
+  for (const [re, cat] of CATEGORY_HINTS) if (re.test(text)) return cat;
+  return '기타';
+}
+
 /**
- * 봇 메시지에서 "발견" 항목 추출.
- *   🎉 오늘의 발견
- *   [음식]
- *   피자는 노동자들의 음식에서 시작됐다.
+ * 봇 메시지에서 "발견" 추출 (완화된 규칙)
+ *  · [카테고리] 가 있으면 그대로 사용
+ *  · 없어도 "~다/~야/~래/~했다" 같은 사실 서술이면 등록하고 카테고리는 자동 추정
+ *  · 질문만 있는 문장, 시스템 메시지는 제외
  */
 export function parseDiscovery(raw: string): Discovery | null {
   if (!raw) return null;
-  const text = raw.trim();
-  if (!text) return null;
+  if (isSystemMessage(raw)) return null;
 
+  const text = raw.trim();
   const catMatch = text.match(/\[([^\]]{1,20})\]/);
   const category = catMatch ? catMatch[1].trim() : '';
 
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  const titleLine = lines.find((l) => /발견|오늘의|사실|트리비아|알아두면/.test(l)) ?? '';
-  const title = titleLine
-    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
-    .replace(/\[[^\]]*\]/g, '')
-    .replace(/[*_#>]/g, '')
-    .trim();
+  const titleLine = lines.find((l) => /발견|오늘의|사실|트리비아|알아두면|재미있는/.test(l)) ?? '';
+  const title = cleanBody(titleLine) || '오늘의 발견';
 
-  if (!category && !titleLine) return null;
+  const bodyLines = lines.filter((l) => l !== titleLine);
+  const body = cleanBody(bodyLines.join(' '));
+  if (!body || body.length < 10) return null;
 
-  const body = lines
-    .filter((l) => l !== titleLine)
-    .join(' ')
-    .replace(/\[[^\]]*\]/g, ' ')
-    .replace(/https?:\/\/\S+/gi, ' ')
-    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
+  // 질문으로만 이루어진 메시지는 발견이 아님
+  const sentences = body.split(/(?<=[.!?])\s+/).filter(Boolean);
+  const factual = sentences.filter((s) => !s.trim().endsWith('?'));
+  if (factual.length === 0) return null;
 
-  if (!body) return null;
+  const factBody = factual.join(' ').trim();
+  if (factBody.length < 10) return null;
+
+  // 등록 조건: 카테고리 태그 / 발견 제목줄 / 사실 서술 어미
+  const looksFactual = /(다|야|래|죠|지|었어|했어|입니다|이다)[.!]?$/.test(factBody.trim());
+  if (!category && !titleLine && !looksFactual) return null;
 
   return {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    category: category || '기타',
-    title: title || '오늘의 발견',
-    body,
+    category: category || guessCategory(factBody),
+    title,
+    body: factBody,
     at: Date.now(),
   };
 }
 
-/** 추가. 이미 같은 내용이 있으면 false */
 export function addDiscovery(d: Discovery | null): boolean {
   if (!d || typeof window === 'undefined') return false;
   const list = loadDiscoveries();
@@ -145,18 +191,48 @@ export function addDiscovery(d: Discovery | null): boolean {
   return true;
 }
 
-/** 봇 메시지를 받아 자동 파싱 후 저장 */
 export function captureDiscovery(botText: string): Discovery | null {
   const d = parseDiscovery(botText);
   if (!d) return null;
   return addDiscovery(d) ? d : null;
 }
 
+/** ⭐ 버튼용 — 파서가 놓쳐도 사용자가 직접 담는다. 항상 성공시킨다. */
+export function addManual(botText: string): Discovery | null {
+  if (typeof window === 'undefined') return null;
+  const body = cleanBody(botText);
+  if (!body) return null;
+  const list = loadDiscoveries();
+  if (list.some((x) => norm(x.body) === norm(body))) return null; // 이미 있음
+  const catMatch = botText.match(/\[([^\]]{1,20})\]/);
+  const d: Discovery = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    category: catMatch ? catMatch[1].trim() : guessCategory(body),
+    title: '오늘의 발견',
+    body,
+    at: Date.now(),
+  };
+  save([...list, d]);
+  return d;
+}
+
+/** 이미 도감에 담긴 내용인지 (⭐ 채움 표시용) */
+export function hasDiscovery(botText: string): boolean {
+  if (typeof window === 'undefined') return false;
+  const body = cleanBody(botText);
+  if (!body) return false;
+  return loadDiscoveries().some((x) => norm(x.body) === norm(body));
+}
+
 export function countDiscoveries(): number {
   return loadDiscoveries().length;
 }
 
-/** ⚠️ "도감 비우기" 버튼에서만 호출하세요. 새 대화와는 무관합니다. */
+export function removeDiscovery(id: string): void {
+  save(loadDiscoveries().filter((d) => d.id !== id));
+}
+
+/** ⚠️ "도감 비우기" 버튼에서만 호출 */
 export function clearDiscoveries(): void {
   if (typeof window === 'undefined') return;
   window.localStorage.removeItem(KEY);
