@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+.card {
+  @apply rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200;
+}
+
+.btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-3 text-base font-semibold transition active:scale-[0.98];
+}
+
+.btn-primary {
+  @apply btn bg-brand-500 text-white hover:bg-brand-600 disabled:opacity-40;
+}
+
+.btn-ghost {
+  @apply btn bg-white text-slate-700 ring-1 ring-slate-200 hover:bg-slate-100;
+}
