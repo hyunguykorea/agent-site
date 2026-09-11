@@ -1,5 +1,5 @@
 // 파일 위치: pages/history.tsx  (기존 파일 덮어쓰기)
-// 목적: "발견 도감"과 "대화 기록"을 한 페이지에서 탭으로 확인. 저장소는 localStorage 라 영구 유지됩니다.
+// 변경점: 도감 목록도 subscribeDiscoveries 로 구독 → 채팅에서 새 발견이 생기면 즉시 반영
 
 import { useEffect, useState } from 'react';
 import NavBar from '@/components/NavBar';
@@ -8,6 +8,7 @@ import {
   loadDiscoveries,
   clearDiscoveries,
   groupByCategory,
+  subscribeDiscoveries,
   type Discovery,
 } from '@/lib/discoveryStore';
 
@@ -17,8 +18,10 @@ export default function HistoryPage() {
   const [items, setItems] = useState<HistoryItem[]>([]);
 
   useEffect(() => {
-    setDex(loadDiscoveries());
+    const sync = () => setDex(loadDiscoveries());
+    sync();
     setItems(loadHistory());
+    return subscribeDiscoveries(sync);
   }, []);
 
   const grouped = groupByCategory(dex);
@@ -28,7 +31,6 @@ export default function HistoryPage() {
     <main className="min-h-screen bg-slate-50">
       <NavBar />
       <div className="mx-auto w-full max-w-2xl p-4">
-        {/* 탭 */}
         <div className="mb-4 flex gap-2">
           <button
             onClick={() => setTab('dex')}
@@ -60,7 +62,7 @@ export default function HistoryPage() {
               <div className="mb-3 flex justify-end">
                 <button
                   onClick={() => {
-                    if (!confirm('도감을 모두 비울까요?')) return;
+                    if (!confirm('도감을 모두 비울까요? 되돌릴 수 없습니다.')) return;
                     clearDiscoveries();
                     setDex([]);
                   }}
